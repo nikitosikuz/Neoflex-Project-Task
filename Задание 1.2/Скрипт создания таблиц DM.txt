@@ -1,0 +1,17 @@
+create schema if not exists DM;
+
+create table if not exists DM.DM_ACCOUNT_TURNOVER_F(
+	on_date date,
+	account_rk numeric,
+	credit_amount numeric(23,8),
+	credit_amount_rub numeric(23,8),
+	debet_amount numeric(23,8),
+	debet_amount_rub numeric(23,8)
+);
+
+create table if not exists DM.DM_ACCOUNT_BALANCE_F(
+	on_date date not null,
+	account_rk int not null,
+	balance_out float,
+	balance_out_rub float
+);

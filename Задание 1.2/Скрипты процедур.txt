@@ -1,0 +1,144 @@
+-- Процедура ds.fill_account_turnover_f
+create or replace procedure ds.fill_account_turnover_f(i_OnDate date)
+language plpgsql
+as $$
+declare 
+	v_log_id int;
+begin
+	insert into logs.etl_process_log (process_name, start_time)
+	values ('fill_account_turnover_f: ' || i_OnDate, now())
+	returning log_id into v_log_id;
+
+	delete from dm.dm_account_turnover_f
+	where on_date = i_OnDate;
+
+	insert into dm.dm_account_turnover_f (on_date, account_rk, credit_amount, credit_amount_rub, debet_amount, debet_amount_rub)
+	with credit_data as (
+		select p.credit_account_rk as account_rk, sum(p.credit_amount) as credit_amount
+		from ds.ft_posting_f p
+		where oper_date = i_OnDate
+		group by credit_account_rk
+	),
+	debet_data as (
+		select p.debet_account_rk as account_rk, sum(p.debet_amount) as debet_amount
+        from ds.ft_posting_f p
+        where oper_date = i_OnDate
+        group by debet_account_rk
+	),
+    all_accounts as (
+        select c.account_rk as account_rk from credit_data c
+      	union
+        select d.account_rk as account_rk from debet_data d
+    )
+
+	select i_OnDate as on_date, a.account_rk as account_rk, coalesce(c.credit_amount, 0) as credit_amount, coalesce(c.credit_amount, 0) * coalesce(r.reduced_cource, 1) as credit_amount_rub, 
+		coalesce(d.debet_amount, 0) as debet_amount, coalesce(d.debet_amount, 0) * coalesce(r.reduced_cource, 1) as debet_amount_rub
+	from all_accounts a
+	left join credit_data c on c.account_rk = a.account_rk
+    left join debet_data d on d.account_rk = a.account_rk
+    left join ds.md_account_d acc on acc.account_rk = a.account_rk 
+       and i_OnDate between acc.data_actual_date and acc.data_actual_end_date
+    left join ds.md_exchange_rate_d r on r.currency_rk = acc.currency_rk
+       and i_OnDate between r.data_actual_date and r.data_actual_end_date;
+	
+	update logs.etl_process_log
+	set end_time = now(), error_mess = null
+	where log_id = v_log_id;
+
+	exception when others then
+	update logs.etl_process_log
+	set end_time = now(), error_mess = sqlerrm
+	where log_id = v_log_id;
+	
+	raise;
+end;
+$$
+
+-- Запуск расчёта оборотов за январь 2018
+do $$
+declare
+    v_date date;
+begin
+    for v_date in
+        select generate_series('2018-01-01'::date, '2018-01-31'::date, interval '1 day')::date
+    loop
+        call ds.fill_account_turnover_f(v_date);
+    end loop;
+end;
+$$;
+
+-- Начальное заполнение остатков за 31.12.2017
+delete from dm.dm_account_balance_f
+where on_date = '2017-12-31';
+
+insert into dm.dm_account_balance_f (on_date, account_rk, balance_out, balance_out_rub)
+select b.on_date, b.account_rk::int, b.balance_out, b.balance_out * coalesce(r.reduced_cource, 1)
+from ds.ft_balance_f b
+left join ds.md_account_d acc on acc.account_rk = b.account_rk
+   and b.on_date between acc.data_actual_date and acc.data_actual_end_date
+left join ds.md_exchange_rate_d r on r.currency_rk = acc.currency_rk
+   and b.on_date between r.data_actual_date and r.data_actual_end_date
+where b.on_date = '2017-12-31';
+
+-- Процедура ds.fill_acoount_balance_f
+create or replace procedure ds.fill_account_balance_f(i_OnDate date)
+language plpgsql
+as $$
+declare
+    v_log_id int;
+begin
+    insert into logs.etl_process_log (process_name, start_time)
+    values ('fill_account_balance_f: ' || i_OnDate, now())
+    returning log_id into v_log_id;
+
+    delete from dm.dm_account_balance_f
+    where on_date = i_OnDate;
+
+    insert into dm.dm_account_balance_f (on_date, account_rk, balance_out, balance_out_rub)
+    select i_OnDate, acc.account_rk::int,
+        case
+            when acc.char_type = 'А' then coalesce(prev.balance_out, 0) + coalesce(turn.debet_amount, 0) - coalesce(turn.credit_amount, 0)
+            when acc.char_type = 'П' then coalesce(prev.balance_out, 0) - coalesce(turn.debet_amount, 0) + coalesce(turn.credit_amount, 0)
+            else coalesce(prev.balance_out, 0)
+        end as balance_out,
+
+        case
+            when acc.char_type = 'А' then coalesce(prev.balance_out_rub, 0) + coalesce(turn.debet_amount_rub, 0) - coalesce(turn.credit_amount_rub, 0)
+            when acc.char_type = 'П' then coalesce(prev.balance_out_rub, 0) - coalesce(turn.debet_amount_rub, 0) + coalesce(turn.credit_amount_rub, 0)
+            else coalesce(prev.balance_out_rub, 0)
+        end as balance_out_rub
+
+    from ds.md_account_d acc
+    left join dm.dm_account_balance_f prev on prev.account_rk = acc.account_rk::int
+       and prev.on_date = i_OnDate - interval '1 day'
+   	left join dm.dm_account_turnover_f turn on turn.account_rk = acc.account_rk
+       and turn.on_date = i_OnDate
+    where i_OnDate between acc.data_actual_date and acc.data_actual_end_date;
+
+    update logs.etl_process_log
+    set end_time = now(),
+        error_mess = null
+    where log_id = v_log_id;
+
+exception when others then
+    update logs.etl_process_log
+    set end_time = now(),
+        error_mess = sqlerrm
+    where log_id = v_log_id;
+
+    raise;
+end;
+$$;
+
+-- Расчёт остатков за январь 2018:
+do $$
+declare
+    v_date date;
+begin
+    for v_date in
+        select generate_series('2018-01-01'::date, '2018-01-31'::date, interval '1 day')::date
+    loop
+        call ds.fill_account_balance_f(v_date);
+    end loop;
+end;
+$$;
