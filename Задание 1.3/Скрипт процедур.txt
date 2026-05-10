@@ -1,0 +1,150 @@
+-- Процедура dm.fill_f101_round_f
+CREATE OR REPLACE PROCEDURE dm.fill_f101_round_f(i_OnDate date)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_log_id int;
+    v_from_date date;
+    v_to_date date;
+BEGIN
+    v_from_date := date_trunc('month', i_OnDate - interval '1 month')::date;
+    v_to_date := (i_OnDate - interval '1 day')::date;
+
+    INSERT INTO logs.etl_process_log (process_name, start_time)
+    VALUES ('fill_f101_round_f: ' || i_OnDate, now())
+    RETURNING log_id INTO v_log_id;
+
+    DELETE FROM dm.dm_f101_round_f
+    WHERE from_date = v_from_date AND to_date = v_to_date;
+
+    INSERT INTO dm.dm_f101_round_f (
+        from_date,
+        to_date,
+        chapter,
+        ledger_account,
+        characteristic,
+        balance_in_rub,
+        balance_in_val,
+        balance_in_total,
+        turn_deb_rub,
+        turn_deb_val,
+        turn_deb_total,
+        turn_cre_rub,
+        turn_cre_val,
+        turn_cre_total,
+        balance_out_rub,
+        balance_out_val,
+        balance_out_total
+    )
+	WITH turnover_month AS (
+	    SELECT
+	        account_rk,
+	        SUM(debet_amount_rub) AS debet_amount_rub,
+	        SUM(credit_amount_rub) AS credit_amount_rub
+	    FROM dm.dm_account_turnover_f
+	    WHERE on_date BETWEEN v_from_date AND v_to_date
+	    GROUP BY account_rk
+	)
+    SELECT
+        v_from_date AS from_date,
+        v_to_date AS to_date,
+
+        l.chapter AS chapter,
+        SUBSTRING(a.account_number FROM 1 FOR 5)::char(5) AS ledger_account,
+        a.char_type AS characteristic,
+
+        SUM(
+            CASE 
+                WHEN a.currency_code IN ('810', '643')
+                THEN COALESCE(bin.balance_out_rub, 0)
+                ELSE 0
+            END
+        ) AS balance_in_rub,
+
+        SUM(
+            CASE 
+                WHEN a.currency_code NOT IN ('810', '643')
+                THEN COALESCE(bin.balance_out_rub, 0)
+                ELSE 0
+            END
+        ) AS balance_in_val,
+
+        SUM(COALESCE(bin.balance_out_rub, 0)) AS balance_in_total,
+
+        SUM(
+            CASE 
+                WHEN a.currency_code IN ('810', '643')
+                THEN COALESCE(t.debet_amount_rub, 0)
+                ELSE 0
+            END
+        ) AS turn_deb_rub,
+
+        SUM(
+            CASE 
+                WHEN a.currency_code NOT IN ('810', '643')
+                THEN COALESCE(t.debet_amount_rub, 0)
+                ELSE 0
+            END
+        ) AS turn_deb_val,
+
+        SUM(COALESCE(t.debet_amount_rub, 0)) AS turn_deb_total,
+
+        SUM(
+            CASE 
+                WHEN a.currency_code IN ('810', '643')
+                THEN COALESCE(t.credit_amount_rub, 0)
+                ELSE 0
+            END
+        ) AS turn_cre_rub,
+
+        SUM(
+            CASE 
+                WHEN a.currency_code NOT IN ('810', '643')
+                THEN COALESCE(t.credit_amount_rub, 0)
+                ELSE 0
+            END
+        ) AS turn_cre_val,
+
+        SUM(COALESCE(t.credit_amount_rub, 0)) AS turn_cre_total,
+
+        SUM(
+            CASE 
+                WHEN a.currency_code IN ('810', '643')
+                THEN COALESCE(bout.balance_out_rub, 0)
+                ELSE 0
+            END
+        ) AS balance_out_rub,
+
+        SUM(
+            CASE 
+                WHEN a.currency_code NOT IN ('810', '643')
+                THEN COALESCE(bout.balance_out_rub, 0)
+                ELSE 0
+            END
+        ) AS balance_out_val,
+
+        SUM(COALESCE(bout.balance_out_rub, 0)) AS balance_out_total
+
+    FROM ds.md_account_d a
+    LEFT JOIN ds.md_ledger_account_s l ON l.ledger_account::text = SUBSTRING(a.account_number FROM 1 FOR 5)
+    LEFT JOIN dm.dm_account_balance_f bin ON bin.account_rk = a.account_rk AND bin.on_date = v_from_date - interval '1 day'
+    LEFT JOIN dm.dm_account_balance_f bout ON bout.account_rk = a.account_rk AND bout.on_date = v_to_date
+    LEFT JOIN turnover_month t ON t.account_rk = a.account_rk	
+    WHERE a.data_actual_date <= v_to_date AND a.data_actual_end_date >= v_from_date
+    GROUP BY l.chapter, SUBSTRING(a.account_number FROM 1 FOR 5), a.char_type;
+
+    UPDATE logs.etl_process_log
+    SET end_time = now(), error_mess = NULL
+    WHERE log_id = v_log_id;
+
+EXCEPTION WHEN OTHERS THEN
+    UPDATE logs.etl_process_log
+    SET end_time = now(), error_mess = SQLERRM
+    WHERE log_id = v_log_id;
+
+    RAISE;
+END;
+$$;
+
+-- Запуск отчёта за январь 2018 года:
+CALL dm.fill_f101_round_f('2018-02-01');
