@@ -1,0 +1,14 @@
+SELECT client_rk, effective_from_date, COUNT(*) AS duplicate_count
+FROM dm.client
+GROUP by client_rk, effective_from_date
+HAVING COUNT(*) > 1;
+
+DELETE FROM dm.client
+WHERE ctid IN (
+    SELECT ctid
+    FROM (
+        SELECT ctid, ROW_NUMBER() OVER (PARTITION BY client_rk, effective_from_date ORDER BY client_rk) AS rn
+        FROM dm.client
+    ) t
+    WHERE rn > 1
+);
